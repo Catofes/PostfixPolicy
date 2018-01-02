@@ -1,0 +1,5 @@
+package: gitlab.threebody.org/qiaohao/PosifixPolicy
+import:
+- package: github.com/go-xorm/xorm
+  version: ^0.6.4
+- package: github.com/lib/pq
