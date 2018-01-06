@@ -26,6 +26,7 @@ func (s *MainConfig) Init(path string) *MainConfig {
 	s.SqlTimeout = 30
 	s.RetryCount = 3
 	s.ProcessCount = 3
+	s.QueuePath = "."
 	data, err := ioutil.ReadFile(path)
 	if err != nil {
 		log.Fatal("[Fatal] Can not read config file.")

@@ -155,11 +155,11 @@ func (s *MainPolicy) parseAddress(from, to mail.Address) (a, b []string) {
 	b = append(b, to.Host)
 	v := strings.Split(from.Host, ".")
 	for i := 0; i+1 < len(v); i++ {
-		a = append(a, "."+strings.Join(v[i:], "."))
+		a = append(a, "."+strings.Join(v[i+1:], "."))
 	}
 	v = strings.Split(to.Host, ".")
 	for i := 0; i+1 < len(v); i++ {
-		b = append(b, "."+strings.Join(v[i:], "."))
+		b = append(b, "."+strings.Join(v[i+1:], "."))
 	}
 	a = append(a, "*")
 	b = append(b, "*")
@@ -173,7 +173,7 @@ func (s *MainPolicy) queryDatabase(from, to []string) string {
 		for _, t := range to {
 			var result string
 			err := s.db.QueryRowContext(ctx, "SELECT destination FROM transport_senders "+
-				"WHERE source=$1 AND to=$2 AND (region=$3 OR region=$4 OR region=$5) ORDER BY region DESC LIMIT 1",
+				"WHERE source=$1 AND recipient=$2 AND (region=$3 OR region=$4 OR region=$5) ORDER BY region DESC LIMIT 1",
 				f, t, s.ServerMark, s.RegionMark, s.DefaultMark).Scan(&result)
 			if err != nil {
 				continue
@@ -272,7 +272,8 @@ func (s *MainPolicy) sendMail(e MyEnvelope, to mail.Address, url *url.URL) {
 			addresses = append(addresses, url.Host)
 			if url.User.Username() != "" {
 				password, _ := url.User.Password()
-				auth = smtp.PlainAuth("", url.User.Username(), password, url.Host)
+				host,_,_ := net.SplitHostPort(url.Host)
+				auth = smtp.PlainAuth("", url.User.Username(), password, host)
 			}
 		} else if url.Scheme == "default" {
 			host, err := net.LookupMX(to.Host)
