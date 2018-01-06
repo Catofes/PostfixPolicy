@@ -1,8 +1,14 @@
-hash: d36a160848b4ba1929945bfc2a61048bf9246ed1aa8dd23ea0919e5a2f5becfe
-updated: 2017-12-27T16:26:54.176856916+08:00
+hash: fb193df8995c55167ca2702566f724db6dc50eea504a4efc65fd65fe667325d0
+updated: 2018-01-05T15:23:53.279820684+08:00
 imports:
 - name: github.com/go-xorm/xorm
   version: 1933dd69e294c0a26c0266637067f24dbb25770c
 - name: github.com/lib/pq
   version: e42267488fe361b9dc034be7a6bffef5b195bceb
+  subpackages:
+  - oid
+- name: github.com/satori/go.uuid
+  version: 879c5887cd475cd7864858769793b2ceb0d44feb
+- name: gopkg.in/gomail.v2
+  version: 81ebce5c23dfd25c6c67194b37d3dd3f338c98b1
 testImports: []

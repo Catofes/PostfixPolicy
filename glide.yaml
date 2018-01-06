@@ -1,5 +1,12 @@
-package: gitlab.threebody.org/qiaohao/PosifixPolicy
+package: github.com/qiaohao/PosifixPolicy
+ignore:
+- github.com/Catofes/go-guerrilla
+- github.com/flashmob/go-guerrilla
 import:
 - package: github.com/go-xorm/xorm
   version: ^0.6.4
 - package: github.com/lib/pq
+- package: github.com/satori/go.uuid
+  version: ^1.1.0
+- package: gopkg.in/gomail.v2
+  version: ^2.0.0
