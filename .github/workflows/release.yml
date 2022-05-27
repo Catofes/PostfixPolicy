@@ -39,7 +39,6 @@ jobs:
         uses: docker/metadata-action@v3
         with:
           images: |
-            catofes/PostfixPolicy
             ghcr.io/catofes/PostfixPolicy
           tags: |
             type=semver,pattern={{raw}}
