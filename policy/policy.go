@@ -1,29 +1,30 @@
 package policy
 
 import (
-	"net"
-	"log"
 	"context"
-	"database/sql"
-	_ "github.com/lib/pq"
-	"github.com/Catofes/go-guerrilla"
-	"github.com/flashmob/go-guerrilla/backends"
-	"github.com/flashmob/go-guerrilla/mail"
-	"strings"
-	"time"
-	"net/url"
-	"net/smtp"
-	"os"
 	"crypto/tls"
+	"database/sql"
 	"errors"
-	"sort"
-	"github.com/satori/go.uuid"
-	"gopkg.in/gomail.v2"
-	"regexp"
 	"fmt"
 	"io/ioutil"
-	"path"
+	"log"
+	"net"
+	"net/smtp"
 	"net/textproto"
+	"net/url"
+	"os"
+	"path"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/flashmob/go-guerrilla"
+	"github.com/flashmob/go-guerrilla/backends"
+	"github.com/flashmob/go-guerrilla/mail"
+	_ "github.com/lib/pq"
+	uuid "github.com/satori/go.uuid"
+	"gopkg.in/gomail.v2"
 )
 
 type MainPolicy struct {
@@ -64,8 +65,9 @@ func (s *MainPolicy) Init(ctx context.Context) *MainPolicy {
 		log.Fatal(err)
 	}
 	config := guerrilla.AppConfig{
-		LogFile:  "stdout",
-		LogLevel: "info",
+		LogFile:      "stdout",
+		LogLevel:     "info",
+		AllowedHosts: []string{"."},
 	}
 	config.BackendConfig = backends.BackendConfig{
 		"save_workers_size":  1,
@@ -74,14 +76,18 @@ func (s *MainPolicy) Init(ctx context.Context) *MainPolicy {
 	}
 	config.Servers = append(config.Servers,
 		guerrilla.ServerConfig{
-			IsEnabled:          true,
-			IgnoreAllowedHosts: true,
-			Hostname:           s.Hostname,
-			MaxSize:            100 * 1024 * 1024,
-			ListenInterface:    s.ListenAddress,
-			PrivateKeyFile:     s.KeyFile,
-			PublicKeyFile:      s.CertFile,
-		}, )
+			IsEnabled:       true,
+			Hostname:        s.Hostname,
+			MaxSize:         int64(100 << 20),
+			ListenInterface: s.ListenAddress,
+			XClientOn:       true,
+			TLS: guerrilla.ServerTLSConfig{
+				PrivateKeyFile: s.KeyFile,
+				PublicKeyFile:  s.CertFile,
+				StartTLSOn:     true,
+			},
+			//IgnoreAllowedHosts: true,
+		})
 
 	s.daemon = &guerrilla.Daemon{Config: &config}
 	s.daemon.AddProcessor("Send", s.Processor)
@@ -197,7 +203,7 @@ func (s *MainPolicy) getDestination(from, to mail.Address) (*url.URL, error) {
 func (s *MainPolicy) returnMail(e MyEnvelope, to mail.Address, err error) {
 	re := MyEnvelope{}
 	re.UUID = uuid.NewV4().String()
-	re.MailFrom = mail.Address{"bounce", "catofes.com"}
+	re.MailFrom = mail.Address{User: "bounce", Host: "catofes.com"}
 	re.RcptTo = append(re.RcptTo, e.MailFrom)
 	re.Subject = "Mail Delivery System "
 	re.IsDSN = true
@@ -248,7 +254,7 @@ func (s *MainPolicy) sendMail(e MyEnvelope, to mail.Address, url *url.URL) {
 		retry
 		failed
 	)
-	parseErr := func(err error) (int) {
+	parseErr := func(err error) int {
 		if err == nil {
 			return success
 		}
@@ -272,7 +278,7 @@ func (s *MainPolicy) sendMail(e MyEnvelope, to mail.Address, url *url.URL) {
 			addresses = append(addresses, url.Host)
 			if url.User.Username() != "" {
 				password, _ := url.User.Password()
-				host,_,_ := net.SplitHostPort(url.Host)
+				host, _, _ := net.SplitHostPort(url.Host)
 				auth = smtp.PlainAuth("", url.User.Username(), password, host)
 			}
 		} else if url.Scheme == "default" {

@@ -136,7 +136,6 @@ func (srv *Server) Serve(ln net.Listener) error {
 		}
 		go sess.serve()
 	}
-	panic("not reached")
 }
 
 type session struct {

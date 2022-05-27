@@ -1,12 +1,13 @@
 package policy
 
 import (
-	"github.com/flashmob/go-guerrilla/mail"
-	"github.com/satori/go.uuid"
 	"encoding/json"
 	"io/ioutil"
 	"log"
 	"os"
+
+	"github.com/flashmob/go-guerrilla/mail"
+	uuid "github.com/satori/go.uuid"
 )
 
 type MyEnvelope struct {

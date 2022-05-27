@@ -1,10 +1,11 @@
 package policy
 
 import (
-	"testing"
-	"github.com/flashmob/go-guerrilla/mail"
 	"context"
 	"log"
+	"testing"
+
+	"github.com/flashmob/go-guerrilla/mail"
 )
 
 func TestMainPolicy_getDestination(t *testing.T) {
@@ -18,7 +19,7 @@ func TestMainPolicy_getDestination(t *testing.T) {
 	mainPolicy := MainPolicy{MainConfig: mainConfig}
 	mainPolicy.Init(context.Background())
 	dest, _ := mainPolicy.getDestination(
-		mail.Address{"test", "catofes.com"},
-		mail.Address{"k", "gmail.com"})
+		mail.Address{User: "test", Host: "catofes.com"},
+		mail.Address{User: "k", Host: "gmail.com"})
 	log.Println(dest.Scheme)
 }

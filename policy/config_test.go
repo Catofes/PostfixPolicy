@@ -1,9 +1,9 @@
 package policy
 
 import (
-	"testing"
 	"encoding/json"
 	"io/ioutil"
+	"testing"
 )
 
 func TestMainConfig_Init(t *testing.T) {

@@ -1,9 +1,9 @@
 package policy
 
 import (
+	"encoding/json"
 	"io/ioutil"
 	"log"
-	"encoding/json"
 )
 
 type MainConfig struct {
