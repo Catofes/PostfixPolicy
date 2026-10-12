@@ -4,7 +4,7 @@
 
 ## 运行
 
-从源码构建建议使用 Go 1.26.1，与 CI 和容器构建版本一致。Linux 本地运行：
+源码构建最低要求 Go 1.25.0，建议使用 Go 1.26.9，与 CI 和容器构建版本一致。Linux 本地运行：
 
 ```sh
 cp config.example.json config.json
