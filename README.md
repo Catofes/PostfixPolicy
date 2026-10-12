@@ -38,7 +38,9 @@ chmod +x postfixpolicy-linux-amd64
 
 镜像地址为 `ghcr.io/<仓库所有者>/<仓库名>`，名称统一转为小写；本仓库为 `ghcr.io/catofes/postfixpolicy`。每个发布镜像包含 `linux/amd64` 和 `linux/arm64`，运行时自带系统 CA 和时区数据。镜像标签包含带 `v` 的版本、去掉 `v` 的版本和 `sha-<短提交号>`。最后成功发布的正式标签还会更新 `latest`，正式运行建议固定版本标签或镜像 digest。
 
-工作流使用仓库自带的 `GITHUB_TOKEN`，无须配置 `CR_PAT`。仓库需要启用 Actions，并允许发布任务的 `contents: write` 和 `packages: write` 权限。如果 GHCR 包已存在，需要在包设置中允许本仓库 Actions 写入；首次发布后也应确认包的可见性，公开仓库不代表镜像一定允许匿名拉取。
+工作流默认使用仓库自带的 `GITHUB_TOKEN`。为兼容旧发布流程，仓库若仍配置了 `CR_PAT`，镜像任务会优先使用该密钥；它需要具备目标包的写入权限，过期时应更新或移除。Release 始终使用 `GITHUB_TOKEN`。仓库需要启用 Actions，并允许发布任务的 `contents: write` 和 `packages: write` 权限。
+
+如果既有 GHCR 包没有授权给本仓库，仅在工作流声明 `packages: write` 仍会报 `permission_denied: write_package`。建议在包的 Settings → Manage Actions access 中加入本仓库并授予 Write 权限，之后移除旧 `CR_PAT`，统一使用 `GITHUB_TOKEN`。首次发布后也应确认包的可见性，公开仓库不代表镜像一定允许匿名拉取。
 
 发布步骤示例（`v1.1.0` 仅作演示，请先确定实际版本）：
 
