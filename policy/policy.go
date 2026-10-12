@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -13,166 +14,320 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
-	"path"
-	"regexp"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/flashmob/go-guerrilla"
 	"github.com/flashmob/go-guerrilla/backends"
 	"github.com/flashmob/go-guerrilla/mail"
 	_ "github.com/lib/pq"
-	uuid "github.com/satori/go.uuid"
 	"gopkg.in/gomail.v2"
 )
 
+type dnsResolver interface {
+	LookupMX(context.Context, string) ([]*net.MX, error)
+	LookupHost(context.Context, string) ([]string, error)
+}
+
 type MainPolicy struct {
 	MainConfig
-	ln        net.Listener
-	ctx       context.Context
-	db        *sql.DB
-	daemon    *guerrilla.Daemon
-	mailQueue chan MyEnvelope
-	lock      chan bool
+	ctx         context.Context
+	db          *sql.DB
+	daemon      *guerrilla.Daemon
+	wake        chan struct{}
+	queueLock   *os.File
+	tlsRoots    *x509.CertPool
+	resolver    dnsResolver
+	dialContext func(context.Context, string, string) (net.Conn, error)
 }
 
 func (s *MainPolicy) Processor() backends.Decorator {
 	return func(p backends.Processor) backends.Processor {
-		return backends.ProcessWith(
-			func(e *mail.Envelope, task backends.SelectTask) (backends.Result, error) {
-				s.mailQueue <- MyEnvelope{Envelope: *e}
-				return p.Process(e, task)
-			},
-		)
+		return backends.ProcessWith(func(e *mail.Envelope, task backends.SelectTask) (backends.Result, error) {
+			result, err := p.Process(e, task)
+			if task != backends.TaskSaveMail || err != nil || result.Code() >= 300 {
+				return result, err
+			}
+			queued, err := snapshot(e)
+			if err == nil {
+				err = queued.Save(s.QueuePath)
+			}
+			if err != nil {
+				return backends.NewResult("451 4.3.0 Unable to persist message"), err
+			}
+			s.notify()
+			return result, nil
+		})
 	}
 }
 
-func (s *MainPolicy) Init(ctx context.Context) *MainPolicy {
-	var err error
-	s.ctx = ctx
+func (s *MainPolicy) Init(ctx context.Context) (*MainPolicy, error) {
+	if err := s.MainConfig.validate(); err != nil {
+		return nil, err
+	}
 	f, err := os.Stat(s.QueuePath)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	s.lock = make(chan bool, s.ProcessCount)
-	if !f.Mode().IsDir() {
-		log.Fatal("Queue Path is not a folder.")
+	if !f.IsDir() {
+		return nil, errors.New("QueuePath is not a directory")
+	}
+	if s.TLSCAFile != "" {
+		pem, err := ioutil.ReadFile(s.TLSCAFile)
+		if err != nil {
+			return nil, err
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(pem) {
+			return nil, errors.New("TLSCAFile contains no CA certificates")
+		}
+		s.tlsRoots = roots
+	}
+	s.queueLock, err = os.OpenFile(filepath.Join(s.QueuePath, ".queue.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(s.queueLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		s.queueLock.Close()
+		return nil, errors.New("queue directory is already in use")
 	}
 	s.db, err = sql.Open("postgres", s.PgURL)
-	s.mailQueue = make(chan MyEnvelope)
 	if err != nil {
-		log.Fatal(err)
+		s.queueLock.Close()
+		return nil, errors.New("invalid PostgreSQL configuration")
 	}
-	config := guerrilla.AppConfig{
-		LogFile:      "stdout",
-		LogLevel:     "info",
-		AllowedHosts: []string{"."},
-	}
+	s.ctx = ctx
+	s.resolver = net.DefaultResolver
+	s.wake = make(chan struct{}, 1)
+	config := guerrilla.AppConfig{LogFile: "stdout", LogLevel: "info", AllowedHosts: []string{"."}}
 	config.BackendConfig = backends.BackendConfig{
 		"save_workers_size":  1,
 		"save_process":       "HeadersParser|Header|Hasher|Send",
 		"log_received_mails": true,
+		"primary_mail_host":  s.Hostname,
 	}
-	config.Servers = append(config.Servers,
-		guerrilla.ServerConfig{
-			IsEnabled:       true,
-			Hostname:        s.Hostname,
-			MaxSize:         int64(100 << 20),
-			ListenInterface: s.ListenAddress,
-			XClientOn:       true,
-			TLS: guerrilla.ServerTLSConfig{
-				PrivateKeyFile: s.KeyFile,
-				PublicKeyFile:  s.CertFile,
-				StartTLSOn:     true,
-			},
-			//IgnoreAllowedHosts: true,
-		})
-
+	config.Servers = []guerrilla.ServerConfig{{
+		IsEnabled: true, Hostname: s.Hostname, MaxSize: int64(100 << 20), ListenInterface: s.ListenAddress,
+		XClientOn: true,
+		TLS:       guerrilla.ServerTLSConfig{PrivateKeyFile: s.KeyFile, PublicKeyFile: s.CertFile, StartTLSOn: true},
+	}}
 	s.daemon = &guerrilla.Daemon{Config: &config}
 	s.daemon.AddProcessor("Send", s.Processor)
-	return s
+	return s, nil
 }
 
+func (s *MainPolicy) notify() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// loop grants one owner per file and bounds both memory use and outgoing work.
 func (s *MainPolicy) loop() {
-	go func() {
-		for {
-			select {
-			case envelope := <-s.mailQueue:
-				go s.handle(envelope)
-			case <-s.ctx.Done():
-				return
+	type completion struct {
+		name string
+		next time.Time
+	}
+	completed := make(chan completion, s.ProcessCount)
+	active := make(map[string]bool)
+	deferred := make(map[string]time.Time)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	scan := func() {
+		if s.ctx.Err() != nil {
+			return
+		}
+		files, err := ioutil.ReadDir(s.QueuePath)
+		if err != nil {
+			log.Printf("Read queue: %v", err)
+			return
+		}
+		for _, file := range files {
+			if len(active) >= s.ProcessCount {
+				break
+			}
+			name := file.Name()
+			if file.IsDir() || filepath.Ext(name) != ".mail" || active[name] || time.Now().Before(deferred[name]) {
+				continue
+			}
+			active[name] = true
+			workers.Add(1)
+			go func(name string) {
+				defer workers.Done()
+				var e MyEnvelope
+				_, err := e.Load(filepath.Join(s.QueuePath, name))
+				if err == nil {
+					err = s.handle(&e)
+				}
+				next := e.nextAttempt()
+				if err != nil {
+					log.Printf("Queue %s: %v; retained for recovery", name, err)
+					next = time.Now().Add(time.Minute)
+				}
+				completed <- completion{name, next}
+			}(name)
+		}
+	}
+	scan()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.wake:
+			scan()
+		case <-ticker.C:
+			scan()
+		case done := <-completed:
+			delete(active, done.name)
+			deferred[done.name] = done.next
+			if done.next.IsZero() {
+				delete(deferred, done.name)
+			}
+			scan()
+		}
+	}
+}
+
+func (e *MyEnvelope) nextAttempt() time.Time {
+	var next time.Time
+	for _, d := range e.Deliveries {
+		if d.Done || d.Held {
+			continue
+		}
+		if d.NextAttempt.IsZero() {
+			return time.Now()
+		}
+		if next.IsZero() || d.NextAttempt.Before(next) {
+			next = d.NextAttempt
+		}
+	}
+	// Held messages stay on disk without repeated delivery attempts.
+	if next.IsZero() {
+		for _, d := range e.Deliveries {
+			if d.Held {
+				return time.Now().Add(time.Hour)
 			}
 		}
-	}()
+	}
+	return next
 }
 
-func (s *MainPolicy) borrow() {
-	s.lock <- true
+func retryDelay(attempt int) time.Duration {
+	delays := [...]time.Duration{time.Minute, 5 * time.Minute, 10 * time.Minute, 30 * time.Minute, time.Hour}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > len(delays) {
+		attempt = len(delays)
+	}
+	return delays[attempt-1]
 }
 
-func (s *MainPolicy) repay() {
-	go func() {
-		<-s.lock
-	}()
+func permanent(err error) bool {
+	var reply *textproto.Error
+	return errors.As(err, &reply) && reply.Code/100 == 5
 }
 
-func (s *MainPolicy) handle(e MyEnvelope) {
-	e.Save(s.QueuePath)
-	getRcpt := func(input []mail.Address) string {
-		str := ""
-		for _, v := range input {
-			str += v.User + "@" + v.Host + " "
+func (s *MainPolicy) handle(e *MyEnvelope) error {
+	for i := range e.Deliveries {
+		if s.ctx.Err() != nil {
+			return s.ctx.Err()
 		}
-		return str
-	}
-	log.Printf("[%s] Received message from %s to %s\n", e.UUID, e.MailFrom.User+"@"+e.MailFrom.Host, getRcpt(e.RcptTo))
-	from := e.MailFrom
-	if e.IsDSN {
-		go func(e MyEnvelope) {
-			s.sendMail(e, e.RcptTo[0], &url.URL{Scheme: "default"})
-		}(e)
-		return
-	}
-	for _, to := range e.RcptTo {
-		go func(e MyEnvelope, to mail.Address) {
-			nexthop, err := s.getDestination(from, to)
+		d := &e.Deliveries[i]
+		if d.Done || d.Held || time.Now().Before(d.NextAttempt) {
+			continue
+		}
+		if !d.Failed {
+			destination := &url.URL{Scheme: "default"}
+			var err error
+			if !e.IsDSN {
+				destination, err = s.getDestination(e.MailFrom, d.Recipient)
+			}
 			if err != nil {
-				s.returnMail(e, to, err)
-				return
+				// Routing failures belong to the administrator, not to the sender.
+				d.LastError = err.Error()
+				d.NextAttempt = time.Now().Add(retryDelay(1))
+				log.Printf("[%s] Route unavailable for %s: %v; queued for retry", e.UUID, d.Recipient.String(), err)
+				if err := e.Save(s.QueuePath); err != nil {
+					return err
+				}
+				continue
 			}
-			s.sendMail(e, to, nexthop)
-		}(e, to)
+			err = s.sendMail(e, d.Recipient, destination)
+			if err != nil && s.ctx.Err() != nil {
+				return s.ctx.Err()
+			}
+			d.Attempts++
+			if err == nil {
+				d.Done = true
+				d.LastError = ""
+				log.Printf("[%s] Delivered to %s", e.UUID, d.Recipient.String())
+			} else {
+				d.LastError = err.Error()
+				d.Failed = permanent(err) || d.Attempts >= s.RetryCount
+				if !d.Failed {
+					d.NextAttempt = time.Now().Add(retryDelay(d.Attempts))
+				}
+				log.Printf("[%s] Delivery attempt %d failed: %v", e.UUID, d.Attempts, err)
+			}
+			if err := e.Save(s.QueuePath); err != nil {
+				return err
+			}
+		}
+		if d.Failed {
+			if e.IsDSN || e.MailFrom.NullPath || e.MailFrom.IsEmpty() {
+				d.Held = true
+				log.Printf("[%s] Undeliverable notification held in queue", e.UUID)
+			} else {
+				// A crash here can replay the notification, but can never discard it.
+				if err := s.returnMail(e, i); err != nil {
+					return err
+				}
+				d.Done = true
+			}
+			if err := e.Save(s.QueuePath); err != nil {
+				return err
+			}
+		}
 	}
+	for _, d := range e.Deliveries {
+		if !d.Done {
+			return nil
+		}
+	}
+	return e.Delete(s.QueuePath)
 }
 
-func (s *MainPolicy) parseAddress(from, to mail.Address) (a, b []string) {
-	a = make([]string, 0)
-	b = make([]string, 0)
-	a = append(a, from.User+"@"+from.Host)
-	b = append(b, to.User+"@"+to.Host)
-	if v := strings.Split(from.User, "+"); len(v) == 2 {
-		a = append(a, v[0]+"@"+from.Host)
+func addressCandidates(address mail.Address) []string {
+	host := strings.ToLower(address.Host)
+	candidates := []string{address.User + "@" + host}
+	if i := strings.IndexByte(address.User, '+'); i > 0 {
+		candidates = append(candidates, address.User[:i]+"@"+host)
 	}
-	if v := strings.Split(to.User, "+"); len(v) == 2 {
-		b = append(b, v[0]+"@"+to.Host)
+	candidates = append(candidates, host)
+	parts := strings.Split(host, ".")
+	for i := 1; i < len(parts); i++ {
+		candidates = append(candidates, "."+strings.Join(parts[i:], "."))
 	}
-	a = append(a, from.Host)
-	b = append(b, to.Host)
-	v := strings.Split(from.Host, ".")
-	for i := 0; i+1 < len(v); i++ {
-		a = append(a, "."+strings.Join(v[i+1:], "."))
-	}
-	v = strings.Split(to.Host, ".")
-	for i := 0; i+1 < len(v); i++ {
-		b = append(b, "."+strings.Join(v[i+1:], "."))
-	}
-	a = append(a, "*")
-	b = append(b, "*")
-	return
+	return append(candidates, "*")
 }
 
-func (s *MainPolicy) queryDatabase(from, to []string) string {
+func (s *MainPolicy) parseAddress(from, to mail.Address) ([]string, []string) {
+	return addressCandidates(from), addressCandidates(to)
+}
+
+func (s *MainPolicy) queryDatabase(from, to []string) (string, error) {
 	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(s.SqlTimeout)*time.Second)
 	defer cancel()
 	for _, f := range from {
@@ -181,175 +336,245 @@ func (s *MainPolicy) queryDatabase(from, to []string) string {
 			err := s.db.QueryRowContext(ctx, "SELECT destination FROM transport_senders "+
 				"WHERE source=$1 AND recipient=$2 AND (region=$3 OR region=$4 OR region=$5) ORDER BY region DESC LIMIT 1",
 				f, t, s.ServerMark, s.RegionMark, s.DefaultMark).Scan(&result)
-			if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
-			return result
+			if err != nil {
+				return "", errors.New("routing database query failed")
+			}
+			return result, nil
 		}
 	}
-	return "default://"
+	return "default://", nil
 }
 
 func (s *MainPolicy) getDestination(from, to mail.Address) (*url.URL, error) {
 	f, t := s.parseAddress(from, to)
-	destination := s.queryDatabase(f, t)
-	result, err := (&url.URL{}).Parse(destination)
+	destination, err := s.queryDatabase(f, t)
 	if err != nil {
+		return nil, err
+	}
+	result, err := url.Parse(destination)
+	if err != nil {
+		return nil, errors.New("invalid route URL")
+	}
+	if err := validateDestination(result); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-func (s *MainPolicy) returnMail(e MyEnvelope, to mail.Address, err error) {
-	re := MyEnvelope{}
-	re.UUID = uuid.NewV4().String()
-	re.MailFrom = mail.Address{User: "bounce", Host: "catofes.com"}
-	re.RcptTo = append(re.RcptTo, e.MailFrom)
-	re.Subject = "Mail Delivery System "
-	re.IsDSN = true
+func validateDestination(destination *url.URL) error {
+	if destination == nil {
+		return errors.New("missing route")
+	}
+	if destination.Opaque != "" || destination.ForceQuery {
+		return errors.New("invalid route URL")
+	}
+	switch destination.Scheme {
+	case "default":
+		if destination.Host != "" || destination.User != nil || destination.Path != "" || destination.RawQuery != "" || destination.Fragment != "" {
+			return errors.New("invalid default route")
+		}
+	case "smtp":
+		host, port, err := net.SplitHostPort(destination.Host)
+		n, portErr := strconv.Atoi(port)
+		if err != nil || host == "" || portErr != nil || n < 1 || n > 65535 || destination.Path != "" || destination.RawQuery != "" || destination.Fragment != "" {
+			return errors.New("SMTP route requires a host and numeric port")
+		}
+	default:
+		return errors.New("unsupported route scheme")
+	}
+	return nil
+}
 
+func (s *MainPolicy) returnMail(e *MyEnvelope, recipient int) error {
+	d := e.Deliveries[recipient]
+	id := e.UUID + "-dsn-" + strconv.Itoa(recipient)
+	name := filepath.Join(s.QueuePath, id+".mail")
+	if _, err := os.Stat(name); err == nil {
+		var existing MyEnvelope
+		if _, err := existing.Load(name); err != nil {
+			return err
+		}
+		if !existing.IsDSN || len(existing.RcptTo) != 1 || existing.RcptTo[0].String() != e.MailFrom.String() {
+			return errors.New("conflicting notification queue file")
+		}
+		s.notify()
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	re := &MyEnvelope{
+		UUID: id, IsDSN: true,
+		MailFrom: mail.Address{NullPath: true}, RcptTo: []mail.Address{e.MailFrom},
+	}
 	m := gomail.NewMessage()
-	m.SetAddressHeader("From", "bounce@catofes.com", "bounce")
-	var myExp = regexp.MustCompile(`^[^<]*<([a-zA-Z0-9_\.\+@\-]+)>$`)
-	m.SetAddressHeader("To", e.MailFrom.User+"@"+e.MailFrom.Host, "bounce")
-	if v := e.Header.Get("From"); v != "" {
-		if s := myExp.FindSubmatch([]byte(v)); s != nil {
-			if len(s) > 1 {
-				m.SetAddressHeader("To", string(s[1]), "")
-			}
-		}
-	}
-	if v := e.Header.Get("Return-path"); v != "" {
-		if s := myExp.FindSubmatch([]byte(v)); s != nil {
-			if len(s) > 1 {
-				m.SetAddressHeader("To", string(s[1]), "")
-			}
-		}
-	}
+	m.SetAddressHeader("From", "postmaster@"+s.Hostname, "Mail Delivery System")
+	m.SetHeader("To", e.MailFrom.String())
 	m.SetHeader("Subject", "Mail delivery failed: returning message to sender")
-	m.SetHeader("Return-path", "<>")
-	m.SetDateHeader("X-Date", time.Now())
-	header := e.Data.String()
-	headerEnd := strings.Index(header, "\n\n")
-	header = header[:headerEnd]
-	message := fmt.Sprintf("This message was created automatically by mail delivery software. "+
-		"<b>A message that you sent could not be delivered to one or more of its"+
-		"recipients<\b>. This is a permanent error.\n The following address(es) failed:<b>\n %s@%s \n<\b>."+
-		"Errors: %s.\n -----This is the copy of the message header -----\n %s \n", to.User, to.Host, err.Error(), header)
-	m.SetBody("text/html", message)
-	m.WriteTo(&re.Data)
-	log.Printf("[%s] Generate return email to %s as %s.\n", e.UUID, m.GetHeader("To")[0], re.UUID)
-	s.mailQueue <- re
+	m.SetHeader("Message-ID", "<"+re.UUID+"@"+s.Hostname+">")
+	m.SetDateHeader("Date", time.Now())
+	header := strings.ReplaceAll(e.Body, "\r\n", "\n")
+	if end := strings.Index(header, "\n\n"); end >= 0 {
+		header = header[:end]
+	} else {
+		header = "(original headers unavailable)"
+	}
+	if len(header) > 32<<10 {
+		header = header[:32<<10]
+	}
+	m.SetBody("text/plain", fmt.Sprintf("Your message could not be delivered to %s.\n\nDelivery error: %s\n\nOriginal message headers:\n%s\n", d.Recipient.String(), d.LastError, header))
+	var body strings.Builder
+	if _, err := m.WriteTo(&body); err != nil {
+		return err
+	}
+	re.Body = body.String()
+	if err := re.Save(s.QueuePath); err != nil {
+		return err
+	}
+	log.Printf("[%s] Notification queued as %s", e.UUID, re.UUID)
+	s.notify()
+	return nil
 }
 
-type sortMX []*net.MX
-
-func (a sortMX) Len() int           { return len(a) }
-func (a sortMX) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a sortMX) Less(i, j int) bool { return a[i].Pref < a[j].Pref }
-
-func (s *MainPolicy) sendMail(e MyEnvelope, to mail.Address, url *url.URL) {
-	const (
-		success = iota
-		retry
-		failed
-	)
-	parseErr := func(err error) int {
-		if err == nil {
-			return success
-		}
-		log.Printf("Send %s not success: %s.\n", e.UUID, err)
-		if v, ok := err.(*textproto.Error); ok {
-			if v.Code/100 == 5 {
-				return failed
-			} else {
-				return retry
-			}
-		}
-		return retry
+func (s *MainPolicy) sendMail(e *MyEnvelope, to mail.Address, destination *url.URL) error {
+	if err := validateDestination(destination); err != nil {
+		return err
 	}
-	status := retry
-	var err error
-	latencyMap := []int{1, 5, 10, 30, 60}
-	for i := 0; i < s.RetryCount && status == retry; i++ {
-		var addresses = make([]string, 0)
-		var auth smtp.Auth = nil
-		if url.Scheme == "smtp" {
-			addresses = append(addresses, url.Host)
-			if url.User.Username() != "" {
-				password, _ := url.User.Password()
-				host, _, _ := net.SplitHostPort(url.Host)
-				auth = smtp.PlainAuth("", url.User.Username(), password, host)
-			}
-		} else if url.Scheme == "default" {
-			host, err := net.LookupMX(to.Host)
-			if err != nil {
-				err = errors.New("ns lookup failed")
-				continue
-			}
-			sort.Sort(sortMX(host))
-			for _, v := range host {
-				addresses = append(addresses, v.Host+":smtp")
-			}
+	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(s.SMTPTimeout)*time.Second)
+	defer cancel()
+	var addresses []string
+	var auth smtp.Auth
+	tlsMode := s.MXTLSMode
+	if destination.Scheme == "smtp" {
+		tlsMode = s.RelayTLSMode
+		addresses = []string{destination.Host}
+		if destination.User.Username() != "" {
+			password, _ := destination.User.Password()
+			auth = smtp.PlainAuth("", destination.User.Username(), password, destination.Hostname())
 		}
-		f := e.MailFrom.User + "@" + e.MailFrom.Host
-		t := append(make([]string, 0), to.User+"@"+to.Host)
-		log.Printf("[%s] Send from %s to %s using %s.\n", e.UUID, f, t[0], addresses)
-		err = s.smtp(addresses, auth, f, t, []byte(e.Data.String()))
-		status = parseErr(err)
-		if status == retry {
-			time.Sleep(time.Duration(latencyMap[i]) * time.Minute)
+	} else {
+		resolver := s.resolver
+		if resolver == nil {
+			resolver = net.DefaultResolver
 		}
-	}
-	defer e.Delete(s.QueuePath + "/" + e.UUID + ".mail")
-	if status == failed {
-		if !e.IsDSN {
-			s.returnMail(e, to, err)
-		}
-	}
-	if status == success {
-		log.Printf("[%s] Send succeed.\n", e.UUID)
-	}
-}
-
-func (s *MainPolicy) smtp(addresses []string, a smtp.Auth, from string, to []string, msg []byte) error {
-	s.borrow()
-	defer s.repay()
-	var err error
-	var c *smtp.Client = nil
-	var addr string
-	for _, address := range addresses {
-		c, err = smtp.Dial(address)
+		mx, err := resolver.LookupMX(ctx, to.Host)
 		if err != nil {
+			var dnsErr *net.DNSError
+			if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+				return fmt.Errorf("MX lookup: %w", err)
+			}
+		}
+		if len(mx) == 0 {
+			// RFC 5321 implicit MX: use the domain's address records when no MX exists.
+			if _, err := resolver.LookupHost(ctx, to.Host); err != nil {
+				return fmt.Errorf("address lookup: %w", err)
+			}
+			addresses = []string{net.JoinHostPort(to.Host, "25")}
+		} else {
+			sort.SliceStable(mx, func(i, j int) bool { return mx[i].Pref < mx[j].Pref })
+			for _, record := range mx {
+				if record.Host == "." {
+					return &textproto.Error{Code: 556, Msg: "recipient domain does not accept mail (null MX)"}
+				}
+				addresses = append(addresses, net.JoinHostPort(strings.TrimSuffix(record.Host, "."), "25"))
+			}
+		}
+	}
+	from := e.MailFrom.String()
+	if e.MailFrom.NullPath || e.IsDSN {
+		from = ""
+	}
+	return s.smtp(ctx, addresses, tlsMode, auth, from, []string{to.String()}, []byte(e.Body))
+}
+
+func (s *MainPolicy) smtp(ctx context.Context, addresses []string, tlsMode string, auth smtp.Auth, from string, to []string, msg []byte) error {
+	if tlsMode != TLSOpportunistic && tlsMode != TLSRequired {
+		return errors.New("invalid SMTP TLS mode")
+	}
+	// Credentials always require an authenticated encrypted connection, even if
+	// a legacy unauthenticated relay was configured for opportunistic TLS.
+	if auth != nil {
+		tlsMode = TLSRequired
+	}
+	if len(addresses) == 0 || len(to) == 0 {
+		return errors.New("empty SMTP destination or recipients")
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.SMTPTimeout)*time.Second)
+	defer cancel()
+	var lastErr error
+	dial := s.dialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	for _, address := range addresses {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return errors.New("invalid SMTP address")
+		}
+		conn, err := dial(ctx, "tcp", address)
+		if err != nil {
+			lastErr = err
 			continue
 		}
-		addr = address
-		break
+		err = s.smtpConnection(ctx, conn, host, tlsMode, auth, from, to, msg)
+		if err == nil || permanent(err) {
+			return err
+		}
+		lastErr = err
 	}
+	return lastErr
+}
+
+func (s *MainPolicy) smtpConnection(ctx context.Context, conn net.Conn, host, tlsMode string, auth smtp.Auth, from string, to []string, msg []byte) error {
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+		}
+	}()
+	c, err := smtp.NewClient(conn, host)
 	if err != nil {
 		return err
 	}
-	defer c.Close()
-	if err = c.Hello(s.SmtpHostName); err != nil {
+	return s.smtpTransaction(c, host, tlsMode, auth, from, to, msg)
+}
+
+func (s *MainPolicy) smtpTransaction(c *smtp.Client, host, tlsMode string, auth smtp.Auth, from string, to []string, msg []byte) error {
+	if err := c.Hello(s.SmtpHostName); err != nil {
 		return err
 	}
 	if ok, _ := c.Extension("STARTTLS"); ok {
-		serverName, _, _ := net.SplitHostPort(addr)
-		config := &tls.Config{ServerName: serverName, InsecureSkipVerify: true}
-		if err = c.StartTLS(config); err != nil {
+		config := &tls.Config{ServerName: host, RootCAs: s.tlsRoots, MinVersion: tls.VersionTLS12}
+		// Opportunistic MX delivery encrypts without requiring Web PKI identity
+		// authentication. Required mode (including all AUTH) verifies certificates.
+		config.InsecureSkipVerify = tlsMode == TLSOpportunistic
+		if err := c.StartTLS(config); err != nil {
+			return err
+		}
+	} else if tlsMode == TLSRequired {
+		return errors.New("SMTP server does not offer required STARTTLS")
+	}
+	if auth != nil {
+		if err := c.Auth(auth); err != nil {
 			return err
 		}
 	}
-	if a != nil {
-		if err = c.Auth(a); err != nil {
-			return err
-		}
-	}
-	if err = c.Mail(from); err != nil {
+	if err := c.Mail(from); err != nil {
 		return err
 	}
-	for _, addr := range to {
-		if err = c.Rcpt(addr); err != nil {
+	for _, recipient := range to {
+		if err := c.Rcpt(recipient); err != nil {
 			return err
 		}
 	}
@@ -357,36 +582,23 @@ func (s *MainPolicy) smtp(addresses []string, a smtp.Auth, from string, to []str
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(msg)
-	if err != nil {
+	if _, err := w.Write(msg); err != nil {
 		return err
 	}
-	err = w.Close()
-	if err != nil {
+	// The final DATA response commits delivery. A later QUIT error must not resend it.
+	if err := w.Close(); err != nil {
 		return err
 	}
-	return c.Quit()
+	return nil
 }
 
-func (s *MainPolicy) load() {
-	files, _ := ioutil.ReadDir(s.QueuePath)
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		} else if path.Ext(file.Name()) == ".mail" {
-			e := MyEnvelope{}
-			e.Load(s.QueuePath + "/" + file.Name())
-			s.mailQueue <- e
-		}
+func (s *MainPolicy) Run() error {
+	defer s.db.Close()
+	defer s.queueLock.Close()
+	if err := s.daemon.Start(); err != nil {
+		return err
 	}
-}
-
-func (s *MainPolicy) Run() {
-	err := s.daemon.Start()
-	if err != nil {
-		log.Panic(err)
-	}
+	defer s.daemon.Shutdown()
 	s.loop()
-	s.load()
-	<-make(chan bool)
+	return nil
 }

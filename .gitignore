@@ -1,3 +1,13 @@
 build
 .idea
 vendor
+dist/
+config.json
+policy.json
+.env
+*.mail
+.queue.lock
+.queue-*.tmp
+*.pem
+*.key
+*.crt

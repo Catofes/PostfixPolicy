@@ -1,0 +1,11 @@
+services:
+  policy:
+    image: ${POSTFIX_POLICY_IMAGE:?Set POSTFIX_POLICY_IMAGE to a published version tag or digest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:2555:2555"
+    volumes:
+      - ./config.json:/etc/policy.json:ro
+      - ./certs:/etc/postfix-policy:ro
+      - ./queue:/var/lib/postfix-policy/queue
+    stop_grace_period: 30s

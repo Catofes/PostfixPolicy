@@ -1,0 +1,19 @@
+{
+  "ListenAddress": "127.0.0.1:2555",
+  "PgURL": "postgres://moemail@127.0.0.1:5432/moemail?sslmode=require",
+  "ServerMark": "4server",
+  "RegionMark": "3region",
+  "DefaultMark": "0default",
+  "Hostname": "mail.example.com",
+  "SmtpHostName": "mail.example.com",
+  "KeyFile": "/etc/postfix-policy/key.pem",
+  "CertFile": "/etc/postfix-policy/cert.pem",
+  "QueuePath": "/var/lib/postfix-policy/queue",
+  "SqlTimeout": 30,
+  "RetryCount": 3,
+  "ProcessCount": 3,
+  "SMTPTimeout": 60,
+  "MXTLSMode": "opportunistic",
+  "RelayTLSMode": "required",
+  "TLSCAFile": ""
+}
